@@ -2,7 +2,6 @@
 
 import json
 import os
-import subprocess
 import sys
 from typing import Any
 
@@ -14,9 +13,8 @@ from langchain_core.tools import tool
 load_dotenv()
 
 SYSTEM_PROMPT = """\
-You are the Primordial Orchestrator. You do not have built-in knowledge or \
-capabilities beyond conversation. Instead, you discover and delegate to \
-specialized agents on the Primordial AgentStore.
+You are the Primordial Orchestrator. You discover and delegate to specialized \
+agents on the Primordial AgentStore.
 
 ## Workflow
 
@@ -24,114 +22,104 @@ specialized agents on the Primordial AgentStore.
 **search_agents** with a relevant query to find agents that can help.
 2. Review the results — read each agent's name and description to pick the \
 best match.
-3. Call **run_agent** with the chosen agent's URL and the user's request.
-4. Synthesize the sub-agent's response into a clear answer for the user.
+3. Call **start_agent** with the chosen agent's URL to spawn it.
+4. Call **message_agent** with the session ID and the user's request.
+5. You can have multi-turn conversations — send follow-up messages to the \
+same session.
+6. Use **monitor_agent** to see what the sub-agent has been doing.
+7. Call **stop_agent** when done with a sub-agent.
 
 ## Rules
 
 - Always search before delegating — don't guess agent URLs.
-- If no agent matches, tell the user honestly and suggest they try a \
-different query.
+- If no agent matches, tell the user honestly.
 - For simple greetings or clarifications, respond directly without delegating.
-- If a task spans multiple domains (e.g., research + task management), search \
-for and delegate to multiple agents sequentially.
+- If a task spans multiple domains, start multiple sub-agents.
 - Always tell the user which agent you're delegating to and why.
+- Use monitor_agent to check on sub-agent progress if a response seems \
+incomplete.
 """
 
 
 @tool
 def search_agents(query: str) -> str:
-    """Search the Primordial AgentStore for agents matching a query.
+    """Semantic search for agents on the Primordial AgentStore.
 
-    Returns a JSON list of available agents with name, description, and URL.
-    Use this to discover which agents can help with the user's request.
+    Returns the top 5 agents ranked by relevance to your query.
 
     Args:
-        query: Search terms describing the capability needed
+        query: Natural language description of the capability needed
             (e.g., "web research", "task management", "code review").
     """
-    print(f"[orchestrator] searching agents: {query}", file=sys.stderr)
-    try:
-        result = subprocess.run(
-            ["primordial", "search", query, "--json"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-        if result.returncode != 0:
-            return f"Search failed: {result.stderr.strip()}"
-        return result.stdout.strip()
-    except FileNotFoundError:
-        return "Error: 'primordial' CLI not found. Is it installed?"
-    except subprocess.TimeoutExpired:
-        return "Search timed out."
+    print(f"[orchestrator] searching: {query}", file=sys.stderr)
+    from primordial_delegate import search
+    return json.dumps(search(query))
 
 
 @tool
-def run_agent(agent_url: str, message: str) -> str:
-    """Delegate a task to a Primordial agent by its GitHub URL.
+def list_all_agents() -> str:
+    """List all agents on the Primordial AgentStore sorted by popularity."""
+    print("[orchestrator] listing all agents", file=sys.stderr)
+    from primordial_delegate import search_all
+    return json.dumps(search_all())
 
-    Spawns the agent as a sub-agent, sends it a message, and returns its
-    response. Use search_agents first to find the right agent URL.
+
+@tool
+def start_agent(agent_url: str) -> str:
+    """Spawn a sub-agent for multi-turn conversation.
+
+    Returns a session_id to use with message_agent and monitor_agent.
 
     Args:
-        agent_url: The GitHub URL of the agent to run
-            (e.g., "https://github.com/user/agent-name").
-        message: The task or question to send to the agent.
+        agent_url: GitHub URL of the agent to run.
     """
-    print(f"[orchestrator] delegating to {agent_url}: {message}", file=sys.stderr)
-    try:
-        proc = subprocess.Popen(
-            ["primordial", "run", agent_url, "--agent-read", "--yes"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+    print(f"[orchestrator] starting: {agent_url}", file=sys.stderr)
+    from primordial_delegate import run_agent
+    return run_agent(agent_url)
 
-        # Wait for ready
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            msg = json.loads(line)
-            if msg.get("type") == "ready":
-                break
 
-        # Send message
-        proc.stdin.write(json.dumps({
-            "type": "message",
-            "content": message,
-            "message_id": "delegate-1",
-        }) + "\n")
-        proc.stdin.flush()
+@tool
+def message_agent(session_id: str, message: str) -> str:
+    """Send a message to a running sub-agent and get its response.
 
-        # Collect response
-        response = ""
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            msg = json.loads(line)
-            if msg.get("type") == "response":
-                response = msg.get("content", "")
-                if msg.get("done"):
-                    break
-            elif msg.get("type") == "error":
-                response = f"Sub-agent error: {msg.get('error', 'unknown')}"
-                break
+    Returns the response text and a summary of tools the sub-agent used.
 
-        # Shutdown
-        proc.stdin.write(json.dumps({"type": "shutdown"}) + "\n")
-        proc.stdin.flush()
-        proc.wait(timeout=10)
+    Args:
+        session_id: Session ID from start_agent.
+        message: The message to send.
+    """
+    print(f"[orchestrator] messaging {session_id}: {message}", file=sys.stderr)
+    from primordial_delegate import message_agent as _msg
+    result = _msg(session_id, message)
+    return json.dumps(result)
 
-        return response or "Sub-agent returned no response."
 
-    except FileNotFoundError:
-        return "Error: 'primordial' CLI not found. Is it installed?"
-    except Exception as e:
-        return f"Delegation error: {e}"
+@tool
+def monitor_agent(session_id: str) -> str:
+    """View the last 1000 lines of a sub-agent's output.
+
+    Shows tool calls, searches, responses, and errors — like scrolling
+    through a terminal to see what the sub-agent has been doing.
+
+    Args:
+        session_id: Session ID from start_agent.
+    """
+    from primordial_delegate import monitor_agent as _mon
+    lines = _mon(session_id)
+    return "\n".join(lines) if lines else "No output yet."
+
+
+@tool
+def stop_agent(session_id: str) -> str:
+    """Shutdown a sub-agent session and save its state.
+
+    Args:
+        session_id: Session ID from start_agent.
+    """
+    print(f"[orchestrator] stopping {session_id}", file=sys.stderr)
+    from primordial_delegate import stop_agent as _stop
+    _stop(session_id)
+    return "Agent stopped."
 
 
 def get_model(model_name: str | None = None) -> Any:
@@ -149,6 +137,13 @@ def create_orchestrator_agent(model_name: str | None = None) -> Any:
 
     return create_deep_agent(
         model=model,
-        tools=[search_agents, run_agent],
+        tools=[
+            search_agents,
+            list_all_agents,
+            start_agent,
+            message_agent,
+            monitor_agent,
+            stop_agent,
+        ],
         system_prompt=SYSTEM_PROMPT,
     )

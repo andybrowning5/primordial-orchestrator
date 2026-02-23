@@ -41,8 +41,6 @@ permissions:
   network:
     - domain: api.anthropic.com
       reason: LLM inference for orchestration decisions
-    - domain: api.github.com
-      reason: Agent discovery via primordial search
   filesystem:
     workspace: readwrite
   delegation:

@@ -82,7 +82,18 @@ def start_agent(agent_url: str) -> str:
     """
     print(f"[orchestrator] starting: {agent_url}", file=sys.stderr)
     from primordial_delegate import run_agent
-    return run_agent(agent_url)
+
+    def _on_status(event: dict) -> None:
+        status = event.get("status", "")
+        sid = event.get("session_id", "")
+        _emit({
+            "type": "activity",
+            "tool": "sub:setup",
+            "description": status,
+            "session_id": sid,
+        })
+
+    return run_agent(agent_url, on_status=_on_status)
 
 
 @tool

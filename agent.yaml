@@ -1,0 +1,49 @@
+name: primordial-orchestrator
+display_name: Primordial Orchestrator
+version: 0.1.0
+description: >
+  Dynamic orchestrator that discovers and delegates to any agent on the
+  Primordial AgentStore. Uses primordial search to find the best agent for
+  each task, then spawns it as a sub-agent. No hardcoded agent URLs — it
+  adapts to whatever agents are available on the store.
+
+category: general
+tags:
+  - orchestrator
+  - delegation
+  - multi-agent
+  - discovery
+
+author:
+  name: Andy Browning
+  github: andybrowning5
+
+runtime:
+  language: python
+  setup_command: pip install .
+  run_command: python -u src/agentstore_adapter.py
+  dependencies: pyproject.toml
+  default_model:
+    provider: anthropic
+    model: claude-sonnet-4-5-20250929
+  resources:
+    max_memory: 2GB
+    max_cpu: 2
+
+keys:
+  - provider: anthropic
+    domain: api.anthropic.com
+    auth_style: x-api-key
+    env_var: ANTHROPIC_API_KEY
+    required: true
+
+permissions:
+  network:
+    - domain: api.anthropic.com
+      reason: LLM inference for orchestration decisions
+    - domain: api.github.com
+      reason: Agent discovery via primordial search
+  filesystem:
+    workspace: readwrite
+  delegation:
+    enabled: true

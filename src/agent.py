@@ -116,6 +116,15 @@ def message_agent(session_id: str, message: str) -> str:
                 })
             elif inner.get("type") == "response" and inner.get("done"):
                 final_response = inner.get("content", "")
+                # Show a preview of the sub-agent's response
+                preview = final_response.replace("\n", " ")[:150].strip()
+                if len(final_response) > 150:
+                    preview += "..."
+                _emit({
+                    "type": "activity",
+                    "tool": "sub:response",
+                    "description": preview,
+                })
 
     return json.dumps({"response": final_response, "activities": activities})
 

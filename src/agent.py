@@ -2,8 +2,9 @@
 
 import json
 import os
+import socket
 import sys
-from typing import Any
+from typing import Any, Generator
 
 from deepagents import create_deep_agent
 from dotenv import load_dotenv
@@ -12,6 +13,46 @@ from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Raw NDJSON delegation helpers (connects to /tmp/_primordial_delegate.sock)
+# ---------------------------------------------------------------------------
+
+_SOCK_PATH = "/tmp/_primordial_delegate.sock"
+_sock: socket.socket | None = None
+_sock_buf: bytes = b""
+
+
+def _get_sock() -> socket.socket:
+    global _sock
+    if _sock is None:
+        _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        _sock.connect(_SOCK_PATH)
+    return _sock
+
+
+def _send(obj: dict) -> None:
+    _get_sock().sendall((json.dumps(obj) + "\n").encode())
+
+
+def _read_line() -> dict:
+    global _sock_buf
+    sock = _get_sock()
+    while b"\n" not in _sock_buf:
+        chunk = sock.recv(8192)
+        if not chunk:
+            raise ConnectionError("Delegation socket closed")
+        _sock_buf += chunk
+    line, _sock_buf = _sock_buf.split(b"\n", 1)
+    return json.loads(line)
+
+
+def _read_stream(stop_fn) -> Generator[dict, None, None]:
+    while True:
+        msg = _read_line()
+        yield msg
+        if stop_fn(msg):
+            return
 
 
 def _emit(msg: dict) -> None:
@@ -59,16 +100,18 @@ def search_agents(query: str) -> str:
             (e.g., "web research", "task management", "code review").
     """
     print(f"[orchestrator] searching: {query}", file=sys.stderr)
-    from primordial_delegate import search
-    return json.dumps(search(query))
+    _send({"type": "search", "query": query})
+    result = _read_line()
+    return json.dumps(result.get("agents", []))
 
 
 @tool
 def list_all_agents() -> str:
     """List all agents on the Primordial AgentStore sorted by popularity."""
     print("[orchestrator] listing all agents", file=sys.stderr)
-    from primordial_delegate import search_all
-    return json.dumps(search_all())
+    _send({"type": "search_all"})
+    result = _read_line()
+    return json.dumps(result.get("agents", []))
 
 
 @tool
@@ -81,19 +124,20 @@ def start_agent(agent_url: str) -> str:
         agent_url: GitHub URL of the agent to run.
     """
     print(f"[orchestrator] starting: {agent_url}", file=sys.stderr)
-    from primordial_delegate import run_agent
-
-    def _on_status(event: dict) -> None:
-        status = event.get("status", "")
-        sid = event.get("session_id", "")
-        _emit({
-            "type": "activity",
-            "tool": "sub:setup",
-            "description": status,
-            "session_id": sid,
-        })
-
-    return run_agent(agent_url, on_status=_on_status)
+    _send({"type": "run", "agent_url": agent_url})
+    for msg in _read_stream(lambda m: m["type"] != "setup_status"):
+        if msg["type"] == "setup_status":
+            _emit({
+                "type": "activity",
+                "tool": "sub:setup",
+                "description": msg.get("status", ""),
+                "session_id": msg.get("session_id", ""),
+            })
+        elif msg["type"] == "session":
+            return msg["session_id"]
+        elif msg["type"] == "error":
+            return f"Error: {msg.get('error', 'unknown')}"
+    return "Error: unexpected end of stream"
 
 
 @tool
@@ -107,41 +151,39 @@ def message_agent(session_id: str, message: str) -> str:
         message: The message to send.
     """
     print(f"[orchestrator] messaging {session_id}: {message}", file=sys.stderr)
-    from primordial_delegate import message_agent_stream
+    _send({"type": "message", "session_id": session_id, "content": message})
 
     activities = []
     final_response = ""
 
-    for event in message_agent_stream(session_id, message):
-        if event.get("type") == "stream_event":
-            inner = event.get("event", {})
-            if inner.get("type") == "activity":
-                tool_name = inner.get("tool", "")
-                desc = inner.get("description", "")
-                activities.append({"tool": tool_name, "description": desc})
-                # Emit to stdout so the TUI shows sub-agent progress
-                # Extract just the args from desc if it's formatted as "tool(args)"
-                args_desc = desc
-                if desc.startswith(f"{tool_name}(") and desc.endswith(")"):
-                    args_desc = desc[len(tool_name) + 1:-1]
-                _emit({
-                    "type": "activity",
-                    "tool": f"sub:{tool_name}",
-                    "description": args_desc,
-                    "session_id": session_id,
-                })
-            elif inner.get("type") == "response" and inner.get("done"):
-                final_response = inner.get("content", "")
-                # Show a preview of the sub-agent's response
-                preview = final_response.replace("\n", " ")[:150].strip()
-                if len(final_response) > 150:
-                    preview += "..."
-                _emit({
-                    "type": "activity",
-                    "tool": "sub:response",
-                    "description": preview,
-                    "session_id": session_id,
-                })
+    for event in _read_stream(lambda m: m.get("done", False)):
+        if event.get("type") != "stream_event":
+            continue
+        inner = event.get("event", {})
+        if inner.get("type") == "activity":
+            tool_name = inner.get("tool", "")
+            desc = inner.get("description", "")
+            activities.append({"tool": tool_name, "description": desc})
+            args_desc = desc
+            if desc.startswith(f"{tool_name}(") and desc.endswith(")"):
+                args_desc = desc[len(tool_name) + 1:-1]
+            _emit({
+                "type": "activity",
+                "tool": f"sub:{tool_name}",
+                "description": args_desc,
+                "session_id": session_id,
+            })
+        elif inner.get("type") == "response" and inner.get("done"):
+            final_response = inner.get("content", "")
+            preview = final_response.replace("\n", " ")[:150].strip()
+            if len(final_response) > 150:
+                preview += "..."
+            _emit({
+                "type": "activity",
+                "tool": "sub:response",
+                "description": preview,
+                "session_id": session_id,
+            })
 
     return json.dumps({"response": final_response, "activities": activities})
 
@@ -156,8 +198,9 @@ def monitor_agent(session_id: str) -> str:
     Args:
         session_id: Session ID from start_agent.
     """
-    from primordial_delegate import monitor_agent as _mon
-    lines = _mon(session_id)
+    _send({"type": "monitor", "session_id": session_id})
+    result = _read_line()
+    lines = result.get("lines", [])
     return "\n".join(lines) if lines else "No output yet."
 
 
@@ -169,8 +212,8 @@ def stop_agent(session_id: str) -> str:
         session_id: Session ID from start_agent.
     """
     print(f"[orchestrator] stopping {session_id}", file=sys.stderr)
-    from primordial_delegate import stop_agent as _stop
-    _stop(session_id)
+    _send({"type": "stop", "session_id": session_id})
+    _read_line()
     return "Agent stopped."
 
 

@@ -13,6 +13,12 @@ from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
 
+
+def _emit(msg: dict) -> None:
+    """Emit a Primordial Protocol event to stdout."""
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
 SYSTEM_PROMPT = """\
 You are the Primordial Orchestrator. You discover and delegate to specialized \
 agents on the Primordial AgentStore.
@@ -90,9 +96,28 @@ def message_agent(session_id: str, message: str) -> str:
         message: The message to send.
     """
     print(f"[orchestrator] messaging {session_id}: {message}", file=sys.stderr)
-    from primordial_delegate import message_agent as _msg
-    result = _msg(session_id, message)
-    return json.dumps(result)
+    from primordial_delegate import message_agent_stream
+
+    activities = []
+    final_response = ""
+
+    for event in message_agent_stream(session_id, message):
+        if event.get("type") == "stream_event":
+            inner = event.get("event", {})
+            if inner.get("type") == "activity":
+                tool_name = inner.get("tool", "")
+                desc = inner.get("description", "")
+                activities.append({"tool": tool_name, "description": desc})
+                # Emit to stdout so the TUI shows sub-agent progress
+                _emit({
+                    "type": "activity",
+                    "tool": f"sub:{tool_name}",
+                    "description": desc,
+                })
+            elif inner.get("type") == "response" and inner.get("done"):
+                final_response = inner.get("content", "")
+
+    return json.dumps({"response": final_response, "activities": activities})
 
 
 @tool

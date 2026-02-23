@@ -9,6 +9,7 @@ from deepagents import create_deep_agent
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
 
@@ -146,4 +147,5 @@ def create_orchestrator_agent(model_name: str | None = None) -> Any:
             stop_agent,
         ],
         system_prompt=SYSTEM_PROMPT,
+        checkpointer=MemorySaver(),
     )

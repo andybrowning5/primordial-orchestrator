@@ -109,10 +109,15 @@ def message_agent(session_id: str, message: str) -> str:
                 desc = inner.get("description", "")
                 activities.append({"tool": tool_name, "description": desc})
                 # Emit to stdout so the TUI shows sub-agent progress
+                # Extract just the args from desc if it's formatted as "tool(args)"
+                args_desc = desc
+                if desc.startswith(f"{tool_name}(") and desc.endswith(")"):
+                    args_desc = desc[len(tool_name) + 1:-1]
                 _emit({
                     "type": "activity",
                     "tool": f"sub:{tool_name}",
-                    "description": desc,
+                    "description": args_desc,
+                    "session_id": session_id,
                 })
             elif inner.get("type") == "response" and inner.get("done"):
                 final_response = inner.get("content", "")
@@ -124,6 +129,7 @@ def message_agent(session_id: str, message: str) -> str:
                     "type": "activity",
                     "tool": "sub:response",
                     "description": preview,
+                    "session_id": session_id,
                 })
 
     return json.dumps({"response": final_response, "activities": activities})

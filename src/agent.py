@@ -26,6 +26,7 @@ _sock_lock = threading.Lock()
 
 
 def _get_sock() -> socket.socket:
+    """Return the shared socket. Caller must hold _sock_lock."""
     global _sock
     if _sock is None:
         _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -71,13 +72,15 @@ def _new_conn() -> _SockConn:
 
 
 def _send(obj: dict) -> None:
-    _get_sock().sendall((json.dumps(obj) + "\n").encode())
+    line = (json.dumps(obj) + "\n").encode()
+    with _sock_lock:
+        _get_sock().sendall(line)
 
 
 def _read_line() -> dict:
     global _sock_buf
-    sock = _get_sock()
     with _sock_lock:
+        sock = _get_sock()
         while b"\n" not in _sock_buf:
             chunk = sock.recv(8192)
             if not chunk:

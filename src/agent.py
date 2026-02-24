@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import sys
+import threading
 from typing import Any, Generator
 
 from deepagents import create_deep_agent
@@ -21,6 +22,7 @@ load_dotenv()
 _SOCK_PATH = "/tmp/_primordial_delegate.sock"
 _sock: socket.socket | None = None
 _sock_buf: bytes = b""
+_sock_lock = threading.Lock()
 
 
 def _get_sock() -> socket.socket:
@@ -31,6 +33,43 @@ def _get_sock() -> socket.socket:
     return _sock
 
 
+class _SockConn:
+    """Buffered socket connection for concurrent use."""
+
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._buf = b""
+
+    def send(self, obj: dict) -> None:
+        self.sock.sendall((json.dumps(obj) + "\n").encode())
+
+    def read_line(self) -> dict:
+        while b"\n" not in self._buf:
+            chunk = self.sock.recv(8192)
+            if not chunk:
+                raise ConnectionError("Delegation socket closed")
+            self._buf += chunk
+        line, self._buf = self._buf.split(b"\n", 1)
+        return json.loads(line)
+
+    def read_stream(self, stop_fn) -> Generator[dict, None, None]:
+        while True:
+            msg = self.read_line()
+            yield msg
+            if stop_fn(msg):
+                return
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+def _new_conn() -> _SockConn:
+    """Create a fresh buffered socket connection (for concurrent operations)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(_SOCK_PATH)
+    return _SockConn(s)
+
+
 def _send(obj: dict) -> None:
     _get_sock().sendall((json.dumps(obj) + "\n").encode())
 
@@ -38,12 +77,13 @@ def _send(obj: dict) -> None:
 def _read_line() -> dict:
     global _sock_buf
     sock = _get_sock()
-    while b"\n" not in _sock_buf:
-        chunk = sock.recv(8192)
-        if not chunk:
-            raise ConnectionError("Delegation socket closed")
-        _sock_buf += chunk
-    line, _sock_buf = _sock_buf.split(b"\n", 1)
+    with _sock_lock:
+        while b"\n" not in _sock_buf:
+            chunk = sock.recv(8192)
+            if not chunk:
+                raise ConnectionError("Delegation socket closed")
+            _sock_buf += chunk
+        line, _sock_buf = _sock_buf.split(b"\n", 1)
     return json.loads(line)
 
 
@@ -55,10 +95,15 @@ def _read_stream(stop_fn) -> Generator[dict, None, None]:
             return
 
 
+_emit_lock = threading.Lock()
+
+
 def _emit(msg: dict) -> None:
-    """Emit a Primordial Protocol event to stdout."""
-    sys.stdout.write(json.dumps(msg) + "\n")
-    sys.stdout.flush()
+    """Emit a Primordial Protocol event to stdout (thread-safe)."""
+    line = json.dumps(msg) + "\n"
+    with _emit_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 SYSTEM_PROMPT = """\
 You are the Primordial Orchestrator. You coordinate specialized agents on \
@@ -80,7 +125,8 @@ or it's a simple greeting/clarification.
 5. You can have multi-turn conversations — send follow-up messages to the \
 same session.
 6. Use **monitor_agent** to check on sub-agent progress.
-7. Call **stop_agent** when done with a sub-agent.
+7. **Before stopping a sub-agent**, always ask the user for confirmation first.
+8. Only call **stop_agent** after the user explicitly approves.
 
 ## Rules
 
@@ -88,6 +134,8 @@ same session.
 - If no agent matches, tell the user and attempt it yourself.
 - If a task spans multiple domains, start multiple sub-agents.
 - Tell the user which agent you're delegating to and why.
+- **NEVER stop a sub-agent without asking the user first.** Always confirm \
+before calling stop_agent.
 """
 
 
@@ -126,20 +174,31 @@ def start_agent(agent_url: str) -> str:
         agent_url: GitHub URL of the agent to run.
     """
     print(f"[orchestrator] starting: {agent_url}", file=sys.stderr)
-    _send({"type": "run", "agent_url": agent_url})
-    for msg in _read_stream(lambda m: m["type"] != "setup_status"):
-        if msg["type"] == "setup_status":
-            _emit({
-                "type": "activity",
-                "tool": "sub:setup",
-                "description": msg.get("status", ""),
-                "session_id": msg.get("session_id", ""),
-            })
-        elif msg["type"] == "session":
-            return msg["session_id"]
-        elif msg["type"] == "error":
-            return f"Error: {msg.get('error', 'unknown')}"
-    return "Error: unexpected end of stream"
+    # Use a dedicated socket so multiple start_agent calls can run concurrently
+    conn = _new_conn()
+    try:
+        conn.send({"type": "run", "agent_url": agent_url})
+        for msg in conn.read_stream(lambda m: m["type"] != "setup_status"):
+            if msg["type"] == "setup_status":
+                _emit({
+                    "type": "activity",
+                    "tool": "sub:setup",
+                    "description": msg.get("status", ""),
+                    "session_id": msg.get("session_id", ""),
+                })
+            elif msg["type"] == "session":
+                _emit({
+                    "type": "activity",
+                    "tool": "sub:spawned",
+                    "description": msg["session_id"],
+                    "session_id": msg.get("session_id", ""),
+                })
+                return msg["session_id"]
+            elif msg["type"] == "error":
+                return f"Error: {msg.get('error', 'unknown')}"
+        return "Error: unexpected end of stream"
+    finally:
+        conn.close()
 
 
 @tool
@@ -209,6 +268,9 @@ def monitor_agent(session_id: str) -> str:
 @tool
 def stop_agent(session_id: str) -> str:
     """Shutdown a sub-agent session and save its state.
+
+    IMPORTANT: Always ask the user for confirmation before calling this tool.
+    Never stop a sub-agent without explicit user approval.
 
     Args:
         session_id: Session ID from start_agent.

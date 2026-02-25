@@ -7,11 +7,17 @@ import sys
 import threading
 from typing import Any, Generator
 
-from deepagents import create_deep_agent
 from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain.agents.middleware.summarization import SummarizationMiddleware
 from langchain.chat_models import init_chat_model
+from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
+
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from deepagents.middleware.subagents import SubAgentMiddleware
 
 load_dotenv()
 
@@ -294,19 +300,50 @@ def get_model(model_name: str | None = None) -> Any:
 
 
 def create_orchestrator_agent(model_name: str | None = None) -> Any:
-    """Create the primordial orchestrator deep agent."""
+    """Create the primordial orchestrator agent without TodoListMiddleware."""
     model = get_model(model_name)
 
-    return create_deep_agent(
-        model=model,
-        tools=[
-            search_agents,
-            list_all_agents,
-            start_agent,
-            message_agent,
-            monitor_agent,
-            stop_agent,
-        ],
+    tools = [
+        search_agents,
+        list_all_agents,
+        start_agent,
+        message_agent,
+        monitor_agent,
+        stop_agent,
+    ]
+
+    trigger = ("tokens", 170000)
+    keep = ("messages", 6)
+
+    middleware = [
+        FilesystemMiddleware(),
+        SubAgentMiddleware(
+            default_model=model,
+            default_tools=tools,
+            subagents=[],
+            default_middleware=[
+                FilesystemMiddleware(),
+                SummarizationMiddleware(
+                    model=model, trigger=trigger, keep=keep,
+                    trim_tokens_to_summarize=None,
+                ),
+                AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
+                PatchToolCallsMiddleware(),
+            ],
+            general_purpose_agent=True,
+        ),
+        SummarizationMiddleware(
+            model=model, trigger=trigger, keep=keep,
+            trim_tokens_to_summarize=None,
+        ),
+        AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"),
+        PatchToolCallsMiddleware(),
+    ]
+
+    return create_agent(
+        model,
         system_prompt=SYSTEM_PROMPT,
+        tools=tools,
+        middleware=middleware,
         checkpointer=MemorySaver(),
-    )
+    ).with_config({"recursion_limit": 1000})

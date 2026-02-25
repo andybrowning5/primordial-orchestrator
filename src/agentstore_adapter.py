@@ -36,12 +36,14 @@ def _extract_response(result: dict[str, Any]) -> str:
     return ""
 
 
+__emitted_tool_calls: set[str] = set()
+
+
 def handle_message(agent: Any, config: dict, content: str, message_id: str) -> None:
     """Process a user message through the orchestrator agent."""
     try:
         messages: list[dict[str, str]] = [{"role": "user", "content": content}]
         final_response = ""
-        emitted_tool_calls: set[str] = set()
 
         if hasattr(agent, "stream"):
             for event in agent.stream(
@@ -60,9 +62,9 @@ def handle_message(agent: Any, config: dict, content: str, message_id: str) -> N
                     ):
                         for tc in msg.tool_calls:
                             tc_id = tc.get("id") or tc.get("name", "")
-                            if tc_id in emitted_tool_calls:
+                            if tc_id in _emitted_tool_calls:
                                 continue
-                            emitted_tool_calls.add(tc_id)
+                            _emitted_tool_calls.add(tc_id)
                             tool_name = tc.get("name", "unknown")
                             tool_args = tc.get("args", {})
                             query = (

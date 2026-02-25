@@ -36,7 +36,7 @@ def _extract_response(result: dict[str, Any]) -> str:
     return ""
 
 
-__emitted_tool_calls: set[str] = set()
+_emitted_tool_calls: set[str] = set()
 
 
 def handle_message(agent: Any, config: dict, content: str, message_id: str) -> None:
